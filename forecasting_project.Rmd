@@ -1,0 +1,587 @@
+---
+title: "TÜİK Foreign Trade Indices Forecasting Project"
+author: "Zeynep Sena Heptaş"
+date: "2026-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Project Overview
+
+This project forecasts Turkey's Export Unit Value Index [2015=100] using monthly
+data obtained from the TÜİK Data Portal. Data access is performed reproducibly
+through the `tuikr` R package (theme 17: International Trade).
+
+# 2. Data Access via tuikr
+
+```{r data-access}
+library(tuikr)
+library(dplyr)
+library(readxl)
+library(httr)
+
+# Use tuikr to access TÜİK International Trade theme (ID: 17)
+dis_ticaret_tables <- statistical_tables("17")
+
+# Retrieve the official TÜİK URL for Foreign Trade Indices (istab type)
+data_url <- dis_ticaret_tables |>
+  filter(node_type == "istab") |>
+  filter(grepl("Foreign Trade Indices", table_name)) |>
+  slice(1) |>
+  pull(table_url)
+
+cat("TÜİK Theme: International Trade (17)\n")
+cat("Table: Foreign Trade Indices\n")
+cat("URL obtained via tuikr:\n", data_url, "\n\n")
+cat("Note: Direct HTTP GET from Posit Cloud returns HTTP 403 due to TÜİK IP\n")
+cat("restrictions. The file was downloaded via browser using the URL above.\n")
+cat("No manual editing was performed on the raw file.\n")
+
+# Load the raw file
+df_raw <- read_excel("Foreign Trade Indices.xls", sheet = 1)
+cat("\nRaw data loaded:", nrow(df_raw), "rows,", ncol(df_raw), "columns\n")
+```
+
+# 3. Data Preparation
+
+```{r data-prep}
+library(tidyr)
+library(lubridate)
+
+# Rows 6-19 contain Export Unit Value Index values (years 2013-2026)
+df_ihracat <- df_raw[6:19, 1:13]
+colnames(df_ihracat) <- c("Year","Jan","Feb","Mar","Apr","May","Jun",
+                           "Jul","Aug","Sep","Oct","Nov","Dec")
+
+# Convert to long (tidy) format
+df_long <- df_ihracat |>
+  pivot_longer(cols = Jan:Dec, names_to = "Month", values_to = "Value") |>
+  mutate(
+    Value     = as.numeric(Value),
+    Month_num = match(Month, c("Jan","Feb","Mar","Apr","May","Jun",
+                               "Jul","Aug","Sep","Oct","Nov","Dec")),
+    Date      = as.Date(paste(Year, Month_num, "01", sep = "-"))
+  ) |>
+  filter(!is.na(Value)) |>
+  arrange(Date)
+
+# Create ts object (monthly, starting January 2013)
+ts_data <- ts(df_long$Value, start = c(2013, 1), frequency = 12)
+n_obs   <- length(ts_data)
+ts_vec  <- as.numeric(ts_data)
+
+cat("=== DATA SUMMARY ===\n")
+cat("Variable        : Export Unit Value Index [2015=100]\n")
+cat("TÜİK Theme      : International Trade (Theme 17)\n")
+cat("Table           : Foreign Trade Indices\n")
+cat("Frequency       : Monthly\n")
+cat("Coverage        :", as.character(min(df_long$Date)),
+    "to", as.character(max(df_long$Date)), "\n")
+cat("Latest obs.     :", as.character(max(df_long$Date)), "\n")
+cat("Forecast target : 2026-04-01 (April 2026)\n")
+cat("Observations    :", n_obs, "\n")
+cat("Data access date: 2026-05-23\n")
+```
+
+# 4. Exploratory Analysis
+
+```{r eda}
+library(ggplot2)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/tables",  recursive = TRUE, showWarnings = FALSE)
+
+# Actual series plot
+p_actual <- ggplot(df_long, aes(x = Date, y = Value)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  labs(title    = "Export Unit Value Index [2015=100] — Monthly",
+       subtitle = "TÜİK International Trade Data, 2013–2026",
+       x = "Date", y = "Index Value") +
+  theme_minimal()
+print(p_actual)
+ggsave("outputs/figures/actual_series_plot.png", p_actual, width = 10, height = 5)
+
+# Classical decomposition
+plot(decompose(ts_data))
+
+cat("\nMean :", round(mean(ts_vec), 2), "\n")
+cat("SD   :", round(sd(ts_vec),   2), "\n")
+cat("Min  :", round(min(ts_vec),  2), "\n")
+cat("Max  :", round(max(ts_vec),  2), "\n")
+cat("\nThe series shows an upward trend from 2020 onward and mild seasonality.\n")
+```
+
+# 5. Forecasting Methods
+
+## 5.1 Naïve Forecasting
+
+```{r naive}
+library(forecast)
+
+naive_fit    <- naive(ts_data, h = 1)
+naive_fitted <- c(NA, head(ts_vec, -1))
+naive_err    <- ts_vec - naive_fitted
+
+naive_bias <- mean(naive_err, na.rm = TRUE)
+naive_mad  <- mean(abs(naive_err), na.rm = TRUE)
+naive_mse  <- mean(naive_err^2,    na.rm = TRUE)
+naive_mape <- mean(abs(naive_err / ts_vec) * 100, na.rm = TRUE)
+naive_rsfe <- sum(naive_err, na.rm = TRUE)
+naive_ts   <- naive_rsfe / naive_mad
+naive_next <- as.numeric(naive_fit$mean[1])
+
+cat("Naive — Bias:", round(naive_bias,4), "| MAD:", round(naive_mad,4),
+    "| MSE:", round(naive_mse,4), "| MAPE:", round(naive_mape,4),
+    "| RSFE:", round(naive_rsfe,4), "| TS:", round(naive_ts,4),
+    "| Forecast:", round(naive_next,4), "\n")
+
+p_naive <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,        color = "Actual")) +
+  geom_line(aes(y = naive_fitted, color = "Naïve"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Naïve"="red")) +
+  labs(title = "Actual vs Naïve Forecast", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_naive)
+ggsave("outputs/figures/naive_forecast_plot.png", p_naive, width = 10, height = 5)
+```
+
+## 5.2 Moving Average
+
+```{r moving-average}
+ma_k      <- 3
+ma_fitted <- as.numeric(stats::filter(ts_vec, rep(1/ma_k, ma_k), sides = 1))
+ma_err    <- ts_vec - ma_fitted
+
+ma_bias <- mean(ma_err, na.rm = TRUE)
+ma_mad  <- mean(abs(ma_err), na.rm = TRUE)
+ma_mse  <- mean(ma_err^2,    na.rm = TRUE)
+ma_mape <- mean(abs(ma_err / ts_vec) * 100, na.rm = TRUE)
+ma_rsfe <- sum(ma_err, na.rm = TRUE)
+ma_ts   <- ma_rsfe / ma_mad
+ma_next <- mean(tail(ts_vec, ma_k))
+
+cat("MA(3) — Bias:", round(ma_bias,4), "| MAD:", round(ma_mad,4),
+    "| MSE:", round(ma_mse,4), "| MAPE:", round(ma_mape,4),
+    "| RSFE:", round(ma_rsfe,4), "| TS:", round(ma_ts,4),
+    "| Forecast:", round(ma_next,4), "\n")
+
+p_ma <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,     color = "Actual")) +
+  geom_line(aes(y = ma_fitted, color = "MA(3)"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","MA(3)"="darkorange")) +
+  labs(title = "Actual vs Moving Average (k=3)", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_ma)
+ggsave("outputs/figures/moving_average_plot.png", p_ma, width = 10, height = 5)
+```
+
+## 5.3 Weighted Moving Average
+
+```{r wma}
+# Weights: 1/6, 2/6, 3/6 — more weight on recent observations
+w         <- c(1/6, 2/6, 3/6)
+wma_fitted <- rep(NA_real_, n_obs)
+for (i in 3:n_obs) wma_fitted[i] <- sum(w * ts_vec[(i-2):i])
+wma_err  <- ts_vec - wma_fitted
+
+wma_bias <- mean(wma_err, na.rm = TRUE)
+wma_mad  <- mean(abs(wma_err), na.rm = TRUE)
+wma_mse  <- mean(wma_err^2,    na.rm = TRUE)
+wma_mape <- mean(abs(wma_err / ts_vec) * 100, na.rm = TRUE)
+wma_rsfe <- sum(wma_err, na.rm = TRUE)
+wma_ts   <- wma_rsfe / wma_mad
+wma_next <- sum(w * ts_vec[(n_obs-2):n_obs])
+
+cat("WMA — Bias:", round(wma_bias,4), "| MAD:", round(wma_mad,4),
+    "| MSE:", round(wma_mse,4), "| MAPE:", round(wma_mape,4),
+    "| RSFE:", round(wma_rsfe,4), "| TS:", round(wma_ts,4),
+    "| Forecast:", round(wma_next,4), "\n")
+
+p_wma <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,      color = "Actual")) +
+  geom_line(aes(y = wma_fitted, color = "WMA"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","WMA"="purple")) +
+  labs(title = "Actual vs Weighted Moving Average", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_wma)
+ggsave("outputs/figures/weighted_moving_average_plot.png", p_wma, width = 10, height = 5)
+```
+
+## 5.4 Exponential Smoothing
+
+```{r exp-smoothing}
+alpha     <- 0.3
+es_fitted <- rep(NA_real_, n_obs)
+es_fitted[1] <- ts_vec[1]
+for (i in 2:n_obs) es_fitted[i] <- alpha*ts_vec[i-1] + (1-alpha)*es_fitted[i-1]
+es_err  <- ts_vec - es_fitted
+
+es_bias <- mean(es_err, na.rm = TRUE)
+es_mad  <- mean(abs(es_err), na.rm = TRUE)
+es_mse  <- mean(es_err^2,    na.rm = TRUE)
+es_mape <- mean(abs(es_err / ts_vec) * 100, na.rm = TRUE)
+es_rsfe <- sum(es_err, na.rm = TRUE)
+es_ts   <- es_rsfe / es_mad
+es_next <- alpha*ts_vec[n_obs] + (1-alpha)*es_fitted[n_obs]
+
+cat("ES(0.3) — Bias:", round(es_bias,4), "| MAD:", round(es_mad,4),
+    "| MSE:", round(es_mse,4), "| MAPE:", round(es_mape,4),
+    "| RSFE:", round(es_rsfe,4), "| TS:", round(es_ts,4),
+    "| Forecast:", round(es_next,4), "\n")
+
+p_es <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,     color = "Actual")) +
+  geom_line(aes(y = es_fitted, color = "ES"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","ES"="darkgreen")) +
+  labs(title = "Actual vs Exponential Smoothing (α=0.3)", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_es)
+ggsave("outputs/figures/exponential_smoothing_plot.png", p_es, width = 10, height = 5)
+```
+
+## 5.5 Trend-Adjusted Exponential Smoothing
+
+```{r taes}
+alpha_t <- 0.3 ; beta_t <- 0.1
+lev  <- rep(NA_real_, n_obs)
+trnd <- rep(NA_real_, n_obs)
+lev[1] <- ts_vec[1] ; trnd[1] <- 0
+for (i in 2:n_obs) {
+  lev[i]  <- alpha_t*ts_vec[i]       + (1-alpha_t)*(lev[i-1]+trnd[i-1])
+  trnd[i] <- beta_t*(lev[i]-lev[i-1]) + (1-beta_t)*trnd[i-1]
+}
+taes_fitted <- lev + trnd
+taes_err    <- ts_vec - taes_fitted
+
+taes_bias <- mean(taes_err, na.rm = TRUE)
+taes_mad  <- mean(abs(taes_err), na.rm = TRUE)
+taes_mse  <- mean(taes_err^2,    na.rm = TRUE)
+taes_mape <- mean(abs(taes_err / ts_vec) * 100, na.rm = TRUE)
+taes_rsfe <- sum(taes_err, na.rm = TRUE)
+taes_ts   <- taes_rsfe / taes_mad
+taes_next <- lev[n_obs] + trnd[n_obs]
+
+cat("TAES — Bias:", round(taes_bias,4), "| MAD:", round(taes_mad,4),
+    "| MSE:", round(taes_mse,4), "| MAPE:", round(taes_mape,4),
+    "| RSFE:", round(taes_rsfe,4), "| TS:", round(taes_ts,4),
+    "| Forecast:", round(taes_next,4), "\n")
+
+p_taes <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,       color = "Actual")) +
+  geom_line(aes(y = taes_fitted, color = "TAES"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","TAES"="firebrick")) +
+  labs(title = "Actual vs Trend-Adjusted ES (α=0.3, β=0.1)",
+       x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_taes)
+ggsave("outputs/figures/trend_adjusted_smoothing_plot.png", p_taes, width = 10, height = 5)
+```
+
+## 5.6 Linear Trend Projection
+
+```{r linear-trend}
+t_var     <- seq_len(n_obs)
+lm_fit    <- lm(ts_vec ~ t_var)
+lm_fitted <- fitted(lm_fit)
+lm_next   <- as.numeric(predict(lm_fit, newdata = data.frame(t_var = n_obs + 1L)))
+lm_err    <- ts_vec - lm_fitted
+
+lm_bias <- mean(lm_err)
+lm_mad  <- mean(abs(lm_err))
+lm_mse  <- mean(lm_err^2)
+lm_mape <- mean(abs(lm_err / ts_vec) * 100)
+lm_rsfe <- sum(lm_err)
+lm_ts   <- lm_rsfe / lm_mad
+
+cat("LM — Intercept:", round(coef(lm_fit)[1],4),
+    "| Slope:", round(coef(lm_fit)[2],4), "\n")
+cat("LM — Bias:", round(lm_bias,4), "| MAD:", round(lm_mad,4),
+    "| MSE:", round(lm_mse,4), "| MAPE:", round(lm_mape,4),
+    "| RSFE:", round(lm_rsfe,4), "| TS:", round(lm_ts,4),
+    "| Forecast:", round(lm_next,4), "\n")
+
+p_lm <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,     color = "Actual")) +
+  geom_line(aes(y = lm_fitted, color = "Linear Trend"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Linear Trend"="darkred")) +
+  labs(title = "Actual vs Linear Trend Projection", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_lm)
+ggsave("outputs/figures/trend_projection_plot.png", p_lm, width = 10, height = 5)
+```
+
+## 5.7 Seasonal Indices
+
+```{r seasonal-indices}
+# Ratio-to-moving-average seasonal indices (12 months)
+n_full    <- floor(n_obs / 12) * 12          # 156
+ts_mat    <- matrix(ts_vec[seq_len(n_full)], nrow = 12)
+mo_means  <- rowMeans(ts_mat, na.rm = TRUE)
+si        <- mo_means / mean(mo_means)       # length 12
+si_rep    <- rep(si, length.out = n_obs)
+deseas    <- ts_vec / si_rep
+
+t_si      <- seq_len(n_obs)
+lm_si     <- lm(deseas ~ t_si)
+si_fitted <- fitted(lm_si) * si_rep
+si_nt     <- as.numeric(predict(lm_si, newdata = data.frame(t_si = n_obs + 1L)))
+si_next   <- si_nt * si[4]                  # April = index 4
+
+si_err  <- ts_vec - si_fitted
+si_bias <- mean(si_err, na.rm = TRUE)
+si_mad  <- mean(abs(si_err), na.rm = TRUE)
+si_mse  <- mean(si_err^2,    na.rm = TRUE)
+si_mape <- mean(abs(si_err / ts_vec) * 100, na.rm = TRUE)
+si_rsfe <- sum(si_err, na.rm = TRUE)
+si_ts   <- si_rsfe / si_mad
+
+mo_lab <- c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+cat("Seasonal Indices:\n")
+for (i in 1:12) cat(mo_lab[i], ":", round(si[i], 4), "\n")
+cat("High season:", mo_lab[which.max(si)], "\n")
+cat("Low  season:", mo_lab[which.min(si)], "\n")
+cat("SI — Bias:", round(si_bias,4), "| MAD:", round(si_mad,4),
+    "| MSE:", round(si_mse,4), "| MAPE:", round(si_mape,4),
+    "| RSFE:", round(si_rsfe,4), "| TS:", round(si_ts,4),
+    "| Forecast:", round(si_next,4), "\n")
+
+p_si <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,     color = "Actual")) +
+  geom_line(aes(y = si_fitted, color = "Seasonal Indices"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Seasonal Indices"="darkviolet")) +
+  labs(title = "Actual vs Seasonal Indices Forecast", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_si)
+ggsave("outputs/figures/seasonal_indices_plot.png", p_si, width = 10, height = 5)
+```
+
+## 5.8 Additive Decomposition
+
+```{r additive-decomp}
+decomp_add  <- decompose(ts_data, type = "additive")
+add_fitted  <- ts_vec - as.numeric(decomp_add$random)
+
+add_err  <- ts_vec - add_fitted
+add_bias <- mean(add_err, na.rm = TRUE)
+add_mad  <- mean(abs(add_err), na.rm = TRUE)
+add_mse  <- mean(add_err^2,    na.rm = TRUE)
+add_mape <- mean(abs(add_err / ts_vec) * 100, na.rm = TRUE)
+add_rsfe <- sum(add_err, na.rm = TRUE)
+add_ts   <- add_rsfe / add_mad
+
+# Forecast trend via OLS on non-NA trend values
+tr_add   <- as.numeric(decomp_add$trend)
+idx_add  <- which(!is.na(tr_add))
+t_idx    <- seq_along(tr_add)
+lm_add   <- lm(tr_add[idx_add] ~ I(t_idx[idx_add]))
+add_nt   <- coef(lm_add)[1] + coef(lm_add)[2] * (n_obs + 1)
+add_next <- as.numeric(add_nt) + as.numeric(decomp_add$seasonal)[4]
+
+cat("ADD — Bias:", round(add_bias,4), "| MAD:", round(add_mad,4),
+    "| MSE:", round(add_mse,4), "| MAPE:", round(add_mape,4),
+    "| RSFE:", round(add_rsfe,4), "| TS:", round(add_ts,4),
+    "| Forecast:", round(add_next,4), "\n")
+
+p_add <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,      color = "Actual")) +
+  geom_line(aes(y = add_fitted, color = "Additive"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Additive"="tomato")) +
+  labs(title = "Actual vs Additive Decomposition", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_add)
+ggsave("outputs/figures/additive_decomposition_plot.png", p_add, width = 10, height = 5)
+```
+
+## 5.9 Multiplicative Decomposition
+
+```{r mult-decomp}
+decomp_mult  <- decompose(ts_data, type = "multiplicative")
+mult_raw     <- ts_vec / as.numeric(decomp_mult$random)
+mult_fitted  <- ifelse(is.finite(mult_raw), mult_raw, NA_real_)
+
+mult_err  <- ts_vec - mult_fitted
+mult_bias <- mean(mult_err, na.rm = TRUE)
+mult_mad  <- mean(abs(mult_err), na.rm = TRUE)
+mult_mse  <- mean(mult_err^2,    na.rm = TRUE)
+mult_mape <- mean(abs(mult_err / ts_vec) * 100, na.rm = TRUE)
+mult_rsfe <- sum(mult_err, na.rm = TRUE)
+mult_ts   <- mult_rsfe / mult_mad
+
+tr_mult  <- as.numeric(decomp_mult$trend)
+idx_mult <- which(!is.na(tr_mult))
+t_idx    <- seq_along(tr_mult)
+lm_mult  <- lm(tr_mult[idx_mult] ~ I(t_idx[idx_mult]))
+mult_nt  <- coef(lm_mult)[1] + coef(lm_mult)[2] * (n_obs + 1)
+mult_next <- as.numeric(mult_nt) * as.numeric(decomp_mult$seasonal)[4]
+
+cat("MULT — Bias:", round(mult_bias,4), "| MAD:", round(mult_mad,4),
+    "| MSE:", round(mult_mse,4), "| MAPE:", round(mult_mape,4),
+    "| RSFE:", round(mult_rsfe,4), "| TS:", round(mult_ts,4),
+    "| Forecast:", round(mult_next,4), "\n")
+
+p_mult <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,       color = "Actual")) +
+  geom_line(aes(y = mult_fitted, color = "Multiplicative"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Multiplicative"="darkgoldenrod")) +
+  labs(title = "Actual vs Multiplicative Decomposition", x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_mult)
+ggsave("outputs/figures/multiplicative_decomposition_plot.png", p_mult, width = 10, height = 5)
+```
+
+## 5.10 Regression with Trend and Seasonal Dummies
+
+```{r reg-seasonal}
+month_num <- rep(1:12, length.out = n_obs)
+reg_df    <- data.frame(y = ts_vec, t_var = t_var)
+for (m in 2:12) reg_df[[paste0("d", m)]] <- as.integer(month_num == m)
+
+reg_fit    <- lm(y ~ ., data = reg_df)
+reg_fitted <- fitted(reg_fit)
+
+new_reg <- data.frame(t_var = n_obs + 1L)
+for (m in 2:12) new_reg[[paste0("d", m)]] <- as.integer(m == 4L)
+reg_next <- as.numeric(predict(reg_fit, newdata = new_reg))
+
+reg_err  <- ts_vec - reg_fitted
+reg_bias <- mean(reg_err)
+reg_mad  <- mean(abs(reg_err))
+reg_mse  <- mean(reg_err^2)
+reg_mape <- mean(abs(reg_err / ts_vec) * 100)
+reg_rsfe <- sum(reg_err)
+reg_ts   <- reg_rsfe / reg_mad
+
+cat("REG — Bias:", round(reg_bias,4), "| MAD:", round(reg_mad,4),
+    "| MSE:", round(reg_mse,4), "| MAPE:", round(reg_mape,4),
+    "| RSFE:", round(reg_rsfe,4), "| TS:", round(reg_ts,4),
+    "| Forecast:", round(reg_next,4), "\n")
+
+p_reg <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,      color = "Actual")) +
+  geom_line(aes(y = reg_fitted, color = "Regression"), linetype = "dashed") +
+  scale_color_manual(values = c("Actual"="steelblue","Regression"="darkgreen")) +
+  labs(title = "Actual vs Regression with Seasonal Dummies",
+       x = "Date", y = "Index", color = "") +
+  theme_minimal()
+print(p_reg)
+ggsave("outputs/figures/regression_seasonal_dummy_plot.png", p_reg, width = 10, height = 5)
+```
+
+# 6. Accuracy Comparison
+
+```{r accuracy-table}
+library(knitr)
+
+accuracy_df <- data.frame(
+  Method = c("Naive","Moving Average","Weighted MA","Exp Smoothing",
+             "Trend-Adj ES","Linear Trend","Seasonal Indices",
+             "Additive Decomp","Multiplicative Decomp","Regression+Seasonal"),
+  Bias          = round(c(naive_bias, ma_bias, wma_bias, es_bias, taes_bias,
+                           lm_bias,   si_bias, add_bias, mult_bias, reg_bias), 4),
+  MAD           = round(c(naive_mad,  ma_mad,  wma_mad,  es_mad,  taes_mad,
+                           lm_mad,    si_mad,  add_mad,  mult_mad,  reg_mad), 4),
+  MSE           = round(c(naive_mse,  ma_mse,  wma_mse,  es_mse,  taes_mse,
+                           lm_mse,    si_mse,  add_mse,  mult_mse,  reg_mse), 4),
+  MAPE          = round(c(naive_mape, ma_mape, wma_mape, es_mape, taes_mape,
+                           lm_mape,   si_mape, add_mape, mult_mape, reg_mape), 4),
+  RSFE          = round(c(naive_rsfe, ma_rsfe, wma_rsfe, es_rsfe, taes_rsfe,
+                           lm_rsfe,   si_rsfe, add_rsfe, mult_rsfe, reg_rsfe), 4),
+  Tracking_Signal = round(c(naive_ts, ma_ts, wma_ts, es_ts, taes_ts,
+                              lm_ts,  si_ts, add_ts, mult_ts, reg_ts), 4),
+  Next_Forecast = round(c(naive_next, ma_next, wma_next, es_next, taes_next,
+                           lm_next,   si_next, add_next, mult_next, reg_next), 4),
+  stringsAsFactors = FALSE
+)
+
+kable(accuracy_df, caption = "Forecast Accuracy Comparison — All Methods")
+write.csv(accuracy_df, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+cat("Accuracy table saved.\n")
+```
+
+# 7. Superior Method & Final Forecast
+
+```{r final}
+best_idx  <- which.min(accuracy_df$MAPE)
+best_name <- accuracy_df$Method[best_idx]
+best_fore <- accuracy_df$Next_Forecast[best_idx]
+
+cat("=== SUPERIOR METHOD ===\n")
+cat("Method    :", best_name, "\n")
+cat("MAPE      :", accuracy_df$MAPE[best_idx], "%\n")
+cat("MAD       :", accuracy_df$MAD[best_idx], "\n")
+cat("Forecast  : April 2026 =", round(best_fore, 2), "\n")
+
+# Match fitted values to superior method
+best_fitted <- switch(best_name,
+  "Regression+Seasonal"   = reg_fitted,
+  "Additive Decomp"       = add_fitted,
+  "Multiplicative Decomp" = mult_fitted,
+  "Seasonal Indices"      = si_fitted,
+  "Linear Trend"          = lm_fitted,
+  "Trend-Adj ES"          = taes_fitted,
+  "Exp Smoothing"         = es_fitted,
+  "Weighted MA"           = wma_fitted,
+  "Moving Average"        = ma_fitted,
+  naive_fitted)
+
+next_pt <- data.frame(Date = as.Date("2026-04-01"), Value = best_fore)
+
+p_best <- ggplot(df_long, aes(x = Date)) +
+  geom_line(aes(y = Value,       color = "Actual")) +
+  geom_line(aes(y = best_fitted, color = "Superior Method"), linetype = "dashed") +
+  geom_point(data = next_pt, aes(y = Value),
+             color = "red", size = 4, shape = 17) +
+  scale_color_manual(values = c("Actual"="steelblue","Superior Method"="darkgreen")) +
+  labs(title    = paste("Superior Method:", best_name),
+       subtitle = paste("April 2026 Forecast:", round(best_fore, 2)),
+       x = "Date", y = "Index Value", color = "") +
+  theme_minimal()
+print(p_best)
+ggsave("outputs/figures/superior_method_plot.png", p_best, width = 10, height = 5)
+
+# Save final forecast table
+final_df <- data.frame(
+  Superior_Method    = best_name,
+  Data_Access_Date   = "2026-05-23",
+  Latest_Observation = "2026-03-01",
+  Forecast_Target    = "2026-04-01",
+  Forecasted_Value   = round(best_fore, 4),
+  MAPE               = accuracy_df$MAPE[best_idx],
+  MAD                = accuracy_df$MAD[best_idx],
+  stringsAsFactors   = FALSE
+)
+kable(final_df, caption = "Final Forecast Result")
+write.csv(final_df, "outputs/tables/final_forecast.csv", row.names = FALSE)
+cat("Final forecast saved.\n")
+```
+
+# 8. Interpretation
+
+The Export Unit Value Index reflects the average price level of Turkish exports
+relative to the 2015 base year. The series displays a clear upward trend from
+2020 onward driven by global commodity price increases and exchange rate
+depreciation, along with mild seasonal fluctuations. The superior method
+captures both trend and seasonal structure, producing a reliable one-step-ahead
+forecast for April 2026.
+
+# 9. Limitations
+
+- TÜİK SDMX API returned HTTP 401/403 from Posit Cloud due to IP restrictions;
+  the data file was accessed through the URL obtained via `tuikr`.
+- Structural breaks (COVID-19 pandemic, 2021–2022 exchange rate volatility) may
+  reduce model accuracy.
+- External variables (exchange rates, commodity prices) are not included.
+- All models assume the recent data-generating process continues into April 2026.
+
+# 10. Reproducibility
+
+1. Install R (≥ 4.0) and RStudio.
+2. Install packages:
+   ```r
+   install.packages(c("devtools","readxl","httr","forecast","ggplot2","tidyr","lubridate","knitr"))
+   devtools::install_github("emraher/tuikr")
+   ```
+3. Place `Foreign Trade Indices.xls` in the project root directory.
+4. Open `forecasting_project.Rmd` and click **Knit**.
